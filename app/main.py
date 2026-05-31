@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from fastapi import FastAPI, Request
 import traceback
 
@@ -20,6 +20,7 @@ from app.database import (
     get_task,
     init_database,
     list_active_tasks,
+    list_next_task_candidates,
     list_planner_context_tasks,
     list_project_context,
     list_project_tasks,
@@ -37,6 +38,9 @@ from app.database import (
     mark_task_done_with_time,
     replace_subtasks,
     save_task,
+    update_task_priority,
+    update_task_reminder,
+    update_task_title,
     update_task_notion_page_id,
     update_task_plan,
     update_task_due_date,
@@ -50,7 +54,13 @@ from app.retrospective import (
     handle_retrospective_response,
     send_evening_retro,
 )
-from app.scheduler import schedule_morning_brief_snooze, shutdown_scheduler, start_scheduler
+from app.scheduler import (
+    schedule_morning_brief_snooze,
+    schedule_pending_task_reminders,
+    schedule_task_reminder,
+    shutdown_scheduler,
+    start_scheduler,
+)
 from app.supervisor import supervise_analysis
 from app.task_intents import find_matching_task, parse_task_intent
 from app.telegram_client import telegram_client
@@ -68,6 +78,7 @@ app = FastAPI(title="Personal AI Workflow Hub")
 async def startup() -> None:
     await init_database()
     start_scheduler()
+    await schedule_pending_task_reminders()
 
 
 @app.on_event("shutdown")
@@ -194,6 +205,15 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
         )
         return {"ok": True}
 
+    if text in {"/next", "/дальше"}:
+        reply, reply_markup = await _build_next_task_reply(chat_id=chat_id)
+        await telegram_client.send_message(
+            chat_id=chat_id,
+            text=reply,
+            reply_markup=reply_markup,
+        )
+        return {"ok": True}
+
     if text in {"/projects", "/проекты"}:
         projects = await list_projects(chat_id=chat_id)
         if not projects:
@@ -225,6 +245,11 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
         await telegram_client.send_message(chat_id=chat_id, text=reply)
         return {"ok": True}
 
+    if text and (text.startswith("/delete") or text.startswith("/удалить")):
+        reply = await _handle_delete_command(text=text, chat_id=chat_id)
+        await telegram_client.send_message(chat_id=chat_id, text=reply)
+        return {"ok": True}
+
     if text and (text.startswith("/cancel") or text.startswith("/отмена")):
         reply = await _handle_status_command(
             text=text,
@@ -233,6 +258,21 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
             success_text="Задача отменена.",
             usage_text="Напиши так: /отмена 1",
         )
+        await telegram_client.send_message(chat_id=chat_id, text=reply)
+        return {"ok": True}
+
+    if text and (text.startswith("/rename") or text.startswith("/переименовать")):
+        reply = await _handle_rename_command(text=text, chat_id=chat_id)
+        await telegram_client.send_message(chat_id=chat_id, text=reply)
+        return {"ok": True}
+
+    if text and (text.startswith("/priority") or text.startswith("/приоритет")):
+        reply = await _handle_priority_command(text=text, chat_id=chat_id)
+        await telegram_client.send_message(chat_id=chat_id, text=reply)
+        return {"ok": True}
+
+    if text and (text.startswith("/remind") or text.startswith("/напомни")):
+        reply = await _handle_remind_command(text=text, chat_id=chat_id)
         await telegram_client.send_message(chat_id=chat_id, text=reply)
         return {"ok": True}
 
@@ -329,6 +369,7 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
 async def _process_text_message(chat_id: int, text: str, prefix: str = "") -> str:
     analysis = await ai_client.analyze_message(text)
     analysis = supervise_analysis(text=text, analysis=analysis)
+    _normalize_analysis_reminder(analysis)
     plan = None
     if analysis.get("assigned_agent") == "planner_agent":
         planner_tasks = await list_planner_context_tasks(chat_id=chat_id)
@@ -377,8 +418,52 @@ async def _process_text_message(chat_id: int, text: str, prefix: str = "") -> st
                 "project": analysis.get("project", ""),
             },
         )
+    reminder_note = await _try_schedule_task_reminder(
+        chat_id=chat_id,
+        task_id=task_id,
+        reminder_at=analysis.get("reminder_at"),
+    )
     notion_note = await _try_sync_task_to_notion(chat_id=chat_id, task_id=task_id)
-    return f"{prefix}Задача #{task_id} сохранена.{notion_note}\n\n{reply}"
+    return f"{prefix}Задача #{task_id} сохранена.{reminder_note}{notion_note}\n\n{reply}"
+
+
+def _normalize_analysis_reminder(analysis: dict) -> None:
+    reminder_at = _normalize_reminder_at(str(analysis.get("reminder_at") or ""))
+    if reminder_at:
+        analysis["reminder_at"] = reminder_at
+        return
+
+    if analysis.get("type") == "reminder" or analysis.get("assigned_agent") == "reminder_agent":
+        due_date = analysis.get("due_date")
+        if due_date:
+            analysis["reminder_at"] = f"{due_date} 10:00"
+
+
+def _normalize_reminder_at(value: str) -> str | None:
+    value = value.strip()
+    if not value:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+    return None
+
+
+async def _try_schedule_task_reminder(chat_id: int, task_id: int, reminder_at: str | None) -> str:
+    if not reminder_at:
+        return ""
+
+    scheduled = schedule_task_reminder(
+        chat_id=chat_id,
+        task_id=task_id,
+        reminder_at=reminder_at,
+    )
+    if not scheduled:
+        return f"\nНапоминание: время не распознано ({reminder_at})."
+    return f"\nНапоминание: {reminder_at}."
 
 
 async def _try_handle_task_intent(chat_id: int, text: str) -> str | None:
@@ -517,6 +602,82 @@ async def _handle_done_command(text: str, chat_id: int) -> str:
     return f"Готово, задача закрыта. Фактическое время: {actual_minutes} мин."
 
 
+async def _handle_delete_command(text: str, chat_id: int) -> str:
+    parts = text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return "Напиши так: /delete 1"
+
+    task_id = int(parts[1])
+    task = await get_task(chat_id=chat_id, task_id=task_id)
+    if task is None:
+        return f"Не нашел задачу #{task_id}."
+
+    await mark_task_cancelled(chat_id=chat_id, task_id=task_id)
+    await _try_sync_task_to_notion(chat_id=chat_id, task_id=task_id)
+    return f"Убрал задачу #{task_id} «{task['title']}» из активных."
+
+
+async def _handle_rename_command(text: str, chat_id: int) -> str:
+    parts = text.split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].strip():
+        return "Напиши так: /rename 1 Новое название задачи"
+
+    task_id = int(parts[1])
+    title = parts[2].strip()
+    updated = await update_task_title(chat_id=chat_id, task_id=task_id, title=title)
+    if not updated:
+        return f"Не нашел задачу #{task_id}."
+
+    await _try_sync_task_to_notion(chat_id=chat_id, task_id=task_id)
+    return f"Переименовал задачу #{task_id}: «{title}»."
+
+
+async def _handle_priority_command(text: str, chat_id: int) -> str:
+    parts = text.split()
+    if len(parts) != 3 or not parts[1].isdigit():
+        return "Напиши так: /priority 1 high"
+
+    priority = parts[2].lower()
+    if priority not in {"high", "medium", "low"}:
+        return "Приоритет должен быть high, medium или low."
+
+    task_id = int(parts[1])
+    updated = await update_task_priority(chat_id=chat_id, task_id=task_id, priority=priority)
+    if not updated:
+        return f"Не нашел задачу #{task_id}."
+
+    await _try_sync_task_to_notion(chat_id=chat_id, task_id=task_id)
+    return f"Обновил приоритет задачи #{task_id}: {priority}."
+
+
+async def _handle_remind_command(text: str, chat_id: int) -> str:
+    parts = text.split(maxsplit=3)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return "Напиши так: /remind 1 2026-06-02 14:30 или /remind 1 off"
+
+    task_id = int(parts[1])
+    task = await get_task(chat_id=chat_id, task_id=task_id)
+    if task is None:
+        return f"Не нашел задачу #{task_id}."
+
+    value = " ".join(parts[2:]).strip()
+    if value.lower() in {"off", "нет", "убрать", "disable"}:
+        await update_task_reminder(chat_id=chat_id, task_id=task_id, reminder_at=None)
+        await _try_sync_task_to_notion(chat_id=chat_id, task_id=task_id)
+        return f"Убрал напоминание у задачи #{task_id}."
+
+    reminder_at = _normalize_reminder_at(value)
+    if reminder_at is None:
+        return "Время напоминания должно быть в формате YYYY-MM-DD HH:MM, например: /remind 1 2026-06-02 14:30"
+
+    await update_task_reminder(chat_id=chat_id, task_id=task_id, reminder_at=reminder_at)
+    scheduled = schedule_task_reminder(chat_id=chat_id, task_id=task_id, reminder_at=reminder_at)
+    await _try_sync_task_to_notion(chat_id=chat_id, task_id=task_id)
+    if not scheduled:
+        return f"Сохранил напоминание для задачи #{task_id}, но не смог поставить его в scheduler: {reminder_at}."
+    return f"Напоминание для задачи #{task_id} поставлено на {reminder_at}."
+
+
 async def _handle_deadline_command(text: str, chat_id: int) -> str:
     parts = text.split()
     if len(parts) != 3 or not parts[1].isdigit():
@@ -586,6 +747,47 @@ async def _build_today_focus_reply(chat_id: int) -> tuple[str, dict | None]:
         )
 
     return "\n".join(lines), _build_task_actions_keyboard(tasks)
+
+
+async def _build_next_task_reply(chat_id: int) -> tuple[str, dict | None]:
+    today = date.today()
+    tasks = await list_next_task_candidates(chat_id=chat_id, today=today.isoformat(), limit=5)
+    if not tasks:
+        return "Активных задач нет. Можно добавить новую задачу обычным сообщением.", None
+
+    task = tasks[0]
+    project = f"\nПроект: {task['project_name']}" if task.get("project_name") else ""
+    timing = _format_task_timing(task=task, today=today)
+    time_info = _format_task_time(task)
+    reminder = f"\nНапоминание: {task['reminder_at']}" if task.get("reminder_at") else ""
+
+    lines = [
+        "Следующий лучший шаг:",
+        "",
+        f"Задача #{task['id']}: {task['title']}",
+        f"Приоритет: {task['priority']}{timing}{time_info}",
+    ]
+    if project:
+        lines.append(project.lstrip())
+    if task.get("next_subtask_title"):
+        lines.extend(
+            [
+                "",
+                f"Начни с подзадачи #{task['next_subtask_id']}: {task['next_subtask_title']}",
+                f"Закрыть шаг: /subdone {task['next_subtask_id']}",
+            ]
+        )
+    else:
+        lines.extend(["", f"Закрыть задачу: /done {task['id']}"])
+    if reminder:
+        lines.append(reminder.lstrip())
+
+    if len(tasks) > 1:
+        lines.extend(["", "Дальше в очереди:"])
+        for next_task in tasks[1:4]:
+            lines.append(f"{next_task['id']}. {next_task['title']} ({next_task['priority']})")
+
+    return "\n".join(lines), _build_task_actions_keyboard([task])
 
 
 async def _build_week_tasks_reply(chat_id: int) -> tuple[str, dict | None]:

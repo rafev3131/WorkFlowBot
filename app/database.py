@@ -45,6 +45,8 @@ async def init_database() -> None:
                 estimated_minutes INTEGER,
                 actual_minutes INTEGER,
                 time_estimation_accuracy REAL,
+                reminder_at TEXT,
+                reminder_sent_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -64,6 +66,10 @@ async def init_database() -> None:
             await db.execute("ALTER TABLE tasks ADD COLUMN actual_minutes INTEGER")
         if "time_estimation_accuracy" not in columns:
             await db.execute("ALTER TABLE tasks ADD COLUMN time_estimation_accuracy REAL")
+        if "reminder_at" not in columns:
+            await db.execute("ALTER TABLE tasks ADD COLUMN reminder_at TEXT")
+        if "reminder_sent_at" not in columns:
+            await db.execute("ALTER TABLE tasks ADD COLUMN reminder_sent_at TEXT")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS subtasks (
@@ -121,9 +127,10 @@ async def save_task(
                 status,
                 analysis_json,
                 result,
-                estimated_minutes
+                estimated_minutes,
+                reminder_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id,
@@ -139,6 +146,7 @@ async def save_task(
                 json.dumps(analysis, ensure_ascii=False),
                 result,
                 _normalize_minutes(analysis.get("estimated_minutes")),
+                analysis.get("reminder_at") or None,
             ),
         )
         await db.commit()
@@ -163,6 +171,8 @@ async def list_recent_tasks(chat_id: int, limit: int = 10) -> list[dict[str, Any
                 tasks.estimated_minutes,
                 tasks.actual_minutes,
                 tasks.time_estimation_accuracy,
+                tasks.reminder_at,
+                tasks.reminder_sent_at,
                 tasks.created_at,
                 projects.name AS project_name
             FROM tasks
@@ -272,6 +282,8 @@ async def get_task(chat_id: int, task_id: int) -> dict[str, Any] | None:
                 estimated_minutes,
                 actual_minutes,
                 time_estimation_accuracy,
+                reminder_at,
+                reminder_sent_at,
                 created_at
             FROM tasks
             WHERE chat_id = ? AND id = ?
@@ -338,6 +350,8 @@ async def list_tasks_by_due_date(
                 tasks.estimated_minutes,
                 tasks.actual_minutes,
                 tasks.time_estimation_accuracy,
+                tasks.reminder_at,
+                tasks.reminder_sent_at,
                 tasks.created_at,
                 projects.name AS project_name
             FROM tasks
@@ -824,6 +838,157 @@ async def update_task_due_date(chat_id: int, task_id: int, due_date: str) -> boo
         return cursor.rowcount > 0
 
 
+async def update_task_title(chat_id: int, task_id: int, title: str) -> bool:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE tasks
+            SET title = ?
+            WHERE chat_id = ? AND id = ?
+            """,
+            (title, chat_id, task_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def update_task_priority(chat_id: int, task_id: int, priority: str) -> bool:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE tasks
+            SET priority = ?
+            WHERE chat_id = ? AND id = ?
+            """,
+            (priority, chat_id, task_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def update_task_reminder(chat_id: int, task_id: int, reminder_at: str | None) -> bool:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE tasks
+            SET reminder_at = ?, reminder_sent_at = NULL
+            WHERE chat_id = ? AND id = ?
+            """,
+            (reminder_at, chat_id, task_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def mark_task_reminder_sent(chat_id: int, task_id: int) -> bool:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE tasks
+            SET reminder_sent_at = CURRENT_TIMESTAMP
+            WHERE chat_id = ? AND id = ?
+            """,
+            (chat_id, task_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def list_next_task_candidates(chat_id: int, today: str, limit: int = 12) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                tasks.id,
+                tasks.title,
+                tasks.task_type,
+                tasks.priority,
+                tasks.assigned_agent,
+                tasks.status,
+                tasks.due_date,
+                tasks.planning_period,
+                tasks.estimated_minutes,
+                tasks.actual_minutes,
+                tasks.time_estimation_accuracy,
+                tasks.reminder_at,
+                projects.name AS project_name,
+                (
+                    SELECT subtasks.id
+                    FROM subtasks
+                    WHERE subtasks.task_id = tasks.id
+                        AND subtasks.chat_id = tasks.chat_id
+                        AND subtasks.status != 'done'
+                    ORDER BY subtasks.position ASC, subtasks.id ASC
+                    LIMIT 1
+                ) AS next_subtask_id,
+                (
+                    SELECT subtasks.title
+                    FROM subtasks
+                    WHERE subtasks.task_id = tasks.id
+                        AND subtasks.chat_id = tasks.chat_id
+                        AND subtasks.status != 'done'
+                    ORDER BY subtasks.position ASC, subtasks.id ASC
+                    LIMIT 1
+                ) AS next_subtask_title
+            FROM tasks
+            LEFT JOIN projects ON projects.id = tasks.project_id
+            WHERE tasks.chat_id = ? AND tasks.status NOT IN ('done', 'cancelled')
+            ORDER BY
+                CASE
+                    WHEN tasks.due_date IS NOT NULL AND tasks.due_date < ? THEN 0
+                    WHEN tasks.due_date = ? THEN 1
+                    WHEN tasks.priority = 'high' THEN 2
+                    WHEN tasks.due_date IS NOT NULL THEN 3
+                    WHEN tasks.planning_period = 'week' THEN 4
+                    ELSE 5
+                END,
+                CASE tasks.priority
+                    WHEN 'high' THEN 0
+                    WHEN 'medium' THEN 1
+                    ELSE 2
+                END,
+                tasks.due_date ASC,
+                tasks.id DESC
+            LIMIT ?
+            """,
+            (chat_id, today, today, limit),
+        )
+        rows = await cursor.fetchall()
+
+    return [dict(row) for row in rows]
+
+
+async def list_pending_reminder_tasks(now: str, limit: int = 100) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                id,
+                chat_id,
+                title,
+                priority,
+                status,
+                due_date,
+                reminder_at,
+                reminder_sent_at
+            FROM tasks
+            WHERE
+                reminder_at IS NOT NULL
+                AND reminder_at != ''
+                AND reminder_sent_at IS NULL
+                AND status NOT IN ('done', 'cancelled')
+            ORDER BY reminder_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+
+    return [dict(row) for row in rows]
+
+
 async def list_tasks_for_notion_sync(chat_id: int, limit: int = 100) -> list[dict[str, Any]]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -843,6 +1008,8 @@ async def list_tasks_for_notion_sync(chat_id: int, limit: int = 100) -> list[dic
                 tasks.estimated_minutes,
                 tasks.actual_minutes,
                 tasks.time_estimation_accuracy,
+                tasks.reminder_at,
+                tasks.reminder_sent_at,
                 tasks.created_at,
                 projects.name AS project_name
             FROM tasks
