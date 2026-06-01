@@ -31,8 +31,8 @@ class NotionClient:
             return page_id
 
         payload["parent"] = {
-            "type": "data_source_id",
-            "data_source_id": settings.notion_tasks_data_source_id,
+            "type": "database_id",
+            "database_id": settings.notion_tasks_data_source_id,
         }
         data = await self._request(
             method="POST",
@@ -56,11 +56,11 @@ class NotionClient:
         if data.get("archived") or data.get("in_trash"):
             return "cancelled"
 
+        props = data.get("properties", {})
+        # Support both new Russian schema and legacy English schema
         notion_status = (
-            data.get("properties", {})
-            .get("Status", {})
-            .get("select", {})
-            .get("name")
+            props.get("Статус", {}).get("select", {}).get("name")
+            or props.get("Status", {}).get("select", {}).get("name")
         )
         return _local_status(notion_status)
 
@@ -153,38 +153,46 @@ class NotionClient:
 
 
 def _build_task_properties(task: dict[str, Any]) -> dict[str, Any]:
+    """Build Notion page properties for the new Russian-schema planner database."""
+    status = _notion_status_new(task.get("status", "in_progress"))
+    urgency, importance = _priority_to_eisenhower(task.get("priority", "medium"))
+
     properties: dict[str, Any] = {
-        "Name": {
+        "Задача": {
             "title": [{"text": {"content": task.get("title", "Без названия")}}],
         },
-        "Status": {
-            "select": {"name": _notion_status(task.get("status", "in_progress"))},
-        },
-        "Priority": {
-            "select": {"name": task.get("priority", "medium")},
-        },
-        "Agent": {
-            "select": {"name": task.get("assigned_agent", "inbox_agent")},
-        },
-        "Local ID": {
-            "number": task.get("id"),
-        },
-        "Type": {
-            "select": {"name": task.get("task_type", "task")},
-        },
+        "Статус": {"select": {"name": status}},
+        "Срочность": {"select": {"name": urgency}},
+        "Важность": {"select": {"name": importance}},
+        "Bot ID": {"number": task.get("id")},
     }
-
-    project_name = task.get("project_name")
-    if project_name:
-        properties["Project"] = {"rich_text": [{"text": {"content": project_name}}]}
 
     due_date = task.get("due_date")
     if due_date:
-        properties["Due"] = {"date": {"start": due_date}}
+        properties["Дедлайн"] = {"date": {"start": due_date}}
 
-    planning_period = task.get("planning_period")
-    if planning_period:
-        properties["Period"] = {"select": {"name": planning_period}}
+    # Energy: map estimated minutes to energy level
+    estimated = task.get("estimated_minutes")
+    if estimated:
+        if estimated <= 15:
+            energy = "⚡ Быстро · до 15 мин"
+        elif estimated <= 60:
+            energy = "🔆 Средне · до 1 ч"
+        else:
+            energy = "🔋 Глубокая работа · 2+ ч"
+        properties["Энергия"] = {"select": {"name": energy}}
+
+    # Notes: include summary and agent
+    notes_parts = []
+    summary = task.get("result") or task.get("summary") or ""
+    if summary:
+        notes_parts.append(summary[:1000])
+    if task.get("assigned_agent"):
+        notes_parts.append(f"Agent: {task['assigned_agent']}")
+    if notes_parts:
+        properties["Заметки"] = {
+            "rich_text": [{"text": {"content": "\n".join(notes_parts)[:2000]}}]
+        }
 
     return properties
 
@@ -302,6 +310,7 @@ def _heading(text: str) -> dict[str, Any]:
 
 
 def _notion_status(status: str) -> str:
+    """Legacy schema status mapping."""
     if status == "done":
         return "Done"
     if status == "cancelled":
@@ -309,10 +318,31 @@ def _notion_status(status: str) -> str:
     return "In Progress"
 
 
+def _notion_status_new(status: str) -> str:
+    """New planner schema status mapping."""
+    mapping = {
+        "done": "✅ Готово",
+        "cancelled": "❌ Отменено",
+        "in_progress": "🔄 В работе",
+        "inbox": "📥 Входящие",
+        "waiting": "⏸ Ожидание",
+    }
+    return mapping.get(status, "📥 Входящие")
+
+
+def _priority_to_eisenhower(priority: str) -> tuple[str, str]:
+    """Map bot priority to Eisenhower urgency + importance."""
+    if priority == "high":
+        return "🔴 Срочно", "⭐ Важно"
+    if priority == "medium":
+        return "🟡 Несрочно", "⭐ Важно"
+    return "🟡 Несрочно", "○ Неважно"
+
+
 def _local_status(status: str | None) -> str:
-    if status == "Done":
+    if status in {"Done", "✅ Готово"}:
         return "done"
-    if status == "Cancelled":
+    if status in {"Cancelled", "❌ Отменено"}:
         return "cancelled"
     return "in_progress"
 

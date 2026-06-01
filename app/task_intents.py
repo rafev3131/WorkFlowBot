@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import json
+import logging
 import re
 from datetime import date
+from pathlib import Path
 from typing import Any
 
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 MONTHS = {
     "января": 1,
@@ -20,7 +26,8 @@ MONTHS = {
     "декабря": 12,
 }
 
-TASK_ALIASES = {
+# Default aliases (bar-specific). Override via TASK_ALIASES_FILE in .env.
+_DEFAULT_TASK_ALIASES: dict[str, tuple[str, ...]] = {
     "pl": ("p&l", "pl", "pnl", "пиэль", "пл"),
     "p&l": ("p&l", "pl", "pnl", "пиэль", "пл"),
     "документац": ("документац", "сэс", "пожар", "охрана труда", "трудовые"),
@@ -30,6 +37,23 @@ TASK_ALIASES = {
     "зарплат": ("зарплат", "выплат"),
     "ревизи": ("ревизи", "инвентаризац"),
 }
+
+
+def _load_task_aliases() -> dict[str, tuple[str, ...]]:
+    """Load aliases from TASK_ALIASES_FILE if configured, else use defaults."""
+    path = settings.task_aliases_file
+    if not path:
+        return _DEFAULT_TASK_ALIASES
+
+    try:
+        raw: dict[str, list[str]] = json.loads(Path(path).read_text(encoding="utf-8"))
+        return {key: tuple(values) for key, values in raw.items()}
+    except Exception as exc:
+        logger.warning("Could not load TASK_ALIASES_FILE %r: %s. Using defaults.", path, exc)
+        return _DEFAULT_TASK_ALIASES
+
+
+TASK_ALIASES: dict[str, tuple[str, ...]] = _load_task_aliases()
 
 DELETE_WORDS = ("удали", "удалить", "убери", "убрать", "отмени", "отменить")
 DEADLINE_WORDS = ("дедлайн", "срок", "до")

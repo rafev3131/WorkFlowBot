@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -25,6 +25,8 @@ async def morning_brief() -> None:
 
 async def send_morning_brief(chat_id: int) -> None:
     today = datetime.now(ZoneInfo(settings.morning_brief_timezone)).date()
+    yesterday = today - timedelta(days=1)
+
     tasks = await list_today_focus_tasks(
         chat_id=chat_id,
         today=today.isoformat(),
@@ -41,6 +43,9 @@ async def send_morning_brief(chat_id: int) -> None:
     )
     memories = await search_memory(chat_id=chat_id, query=memory_query, limit=6)
 
+    # Include yesterday's finance snapshot in context
+    yesterday_finance = await _format_yesterday_finance(chat_id=chat_id, yesterday=yesterday.isoformat())
+
     brief = await ai_client.build_morning_brief(
         today=today.isoformat(),
         task_context=_format_tasks_for_prompt(tasks),
@@ -48,6 +53,7 @@ async def send_morning_brief(chat_id: int) -> None:
         workflow_context=load_workflow_context(),
         retrospective_context=format_retrospective_context(retrospectives),
         memory_context=format_memory_context(memories),
+        yesterday_finance=yesterday_finance,
     )
 
     await telegram_client.send_message(
@@ -55,6 +61,26 @@ async def send_morning_brief(chat_id: int) -> None:
         text=brief,
         reply_markup=_morning_brief_keyboard(),
     )
+
+
+async def _format_yesterday_finance(chat_id: int, yesterday: str) -> str:
+    try:
+        from app.finance.db import revenue_summary, expense_summary
+        rev = await revenue_summary(chat_id, yesterday, yesterday)
+        exp = await expense_summary(chat_id, yesterday, yesterday)
+        if not rev["total"] and not exp["total"]:
+            return "Финансы за вчера не внесены."
+        parts = []
+        if rev["total"]:
+            parts.append(f"Выручка вчера: {rev['total']:,} ₸".replace(",", " "))
+        if exp["total"]:
+            parts.append(f"Расходы: {exp['total']:,} ₸".replace(",", " "))
+        if rev["total"] and exp["total"]:
+            profit = rev["total"] - exp["total"]
+            parts.append(f"Прибыль: {profit:,} ₸".replace(",", " "))
+        return ". ".join(parts) + "."
+    except Exception:
+        return ""
 
 
 def _format_tasks_for_prompt(tasks: list[dict[str, Any]]) -> str:

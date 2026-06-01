@@ -9,97 +9,178 @@ import aiosqlite
 
 DATABASE_PATH = Path("workflow.db")
 
+# Bump this constant when you add a new _migrate_vN function below.
+_SCHEMA_VERSION = 5
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 async def init_database() -> None:
+    """Create / migrate the database to the latest schema version."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS projects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(chat_id, name)
-            )
-            """
-        )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                project_id INTEGER,
-                due_date TEXT,
-                planning_period TEXT NOT NULL DEFAULT '',
-                user_text TEXT NOT NULL,
-                title TEXT NOT NULL,
-                task_type TEXT NOT NULL,
-                priority TEXT NOT NULL,
-                assigned_agent TEXT NOT NULL,
-                status TEXT NOT NULL,
-                analysis_json TEXT NOT NULL,
-                result TEXT NOT NULL,
-                notion_page_id TEXT,
-                estimated_minutes INTEGER,
-                actual_minutes INTEGER,
-                time_estimation_accuracy REAL,
-                reminder_at TEXT,
-                reminder_sent_at TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        columns = await _get_table_columns(db, "tasks")
-        if "project_id" not in columns:
-            await db.execute("ALTER TABLE tasks ADD COLUMN project_id INTEGER")
-        if "due_date" not in columns:
-            await db.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
-        if "planning_period" not in columns:
-            await db.execute("ALTER TABLE tasks ADD COLUMN planning_period TEXT NOT NULL DEFAULT ''")
-        if "notion_page_id" not in columns:
-            await db.execute("ALTER TABLE tasks ADD COLUMN notion_page_id TEXT")
-        if "estimated_minutes" not in columns:
-            await db.execute("ALTER TABLE tasks ADD COLUMN estimated_minutes INTEGER")
-        if "actual_minutes" not in columns:
-            await db.execute("ALTER TABLE tasks ADD COLUMN actual_minutes INTEGER")
-        if "time_estimation_accuracy" not in columns:
-            await db.execute("ALTER TABLE tasks ADD COLUMN time_estimation_accuracy REAL")
-        if "reminder_at" not in columns:
-            await db.execute("ALTER TABLE tasks ADD COLUMN reminder_at TEXT")
-        if "reminder_sent_at" not in columns:
-            await db.execute("ALTER TABLE tasks ADD COLUMN reminder_sent_at TEXT")
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS subtasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'in_progress',
-                position INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS daily_retrospectives (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                retro_date TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'requested',
-                prompt_text TEXT NOT NULL DEFAULT '',
-                response_text TEXT NOT NULL DEFAULT '',
-                summary_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                answered_at TEXT,
-                UNIQUE(chat_id, retro_date)
-            )
-            """
-        )
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA foreign_keys=ON")
+        await _ensure_schema_version_table(db)
+        current_version = await _get_schema_version(db)
+        await _run_migrations(db, current_version)
         await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Migration engine
+# ---------------------------------------------------------------------------
+
+async def _ensure_schema_version_table(db: aiosqlite.Connection) -> None:
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER NOT NULL
+        )
+        """
+    )
+    cursor = await db.execute("SELECT COUNT(*) FROM schema_version")
+    row = await cursor.fetchone()
+    if row and row[0] == 0:
+        await db.execute("INSERT INTO schema_version (version) VALUES (0)")
+
+
+async def _get_schema_version(db: aiosqlite.Connection) -> int:
+    cursor = await db.execute("SELECT version FROM schema_version LIMIT 1")
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def _set_schema_version(db: aiosqlite.Connection, version: int) -> None:
+    await db.execute("UPDATE schema_version SET version = ?", (version,))
+
+
+async def _run_migrations(db: aiosqlite.Connection, current_version: int) -> None:
+    migrations = {
+        1: _migrate_v1_initial_schema,
+        2: _migrate_v2_add_columns,
+        3: _migrate_v3_add_indices,
+        4: _migrate_v4_finance_tables,
+        5: _migrate_v5_subtask_fields,
+    }
+    for version in range(current_version + 1, _SCHEMA_VERSION + 1):
+        migrate_fn = migrations.get(version)
+        if migrate_fn:
+            await migrate_fn(db)
+            await _set_schema_version(db, version)
+
+
+# ---------------------------------------------------------------------------
+# Individual migration steps
+# ---------------------------------------------------------------------------
+
+async def _migrate_v1_initial_schema(db: aiosqlite.Connection) -> None:
+    """Create base tables."""
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, name)
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            project_id INTEGER,
+            due_date TEXT,
+            planning_period TEXT NOT NULL DEFAULT '',
+            user_text TEXT NOT NULL,
+            title TEXT NOT NULL,
+            task_type TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            assigned_agent TEXT NOT NULL,
+            status TEXT NOT NULL,
+            analysis_json TEXT NOT NULL,
+            result TEXT NOT NULL,
+            notion_page_id TEXT,
+            estimated_minutes INTEGER,
+            actual_minutes INTEGER,
+            time_estimation_accuracy REAL,
+            reminder_at TEXT,
+            reminder_sent_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subtasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'in_progress',
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_retrospectives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            retro_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'requested',
+            prompt_text TEXT NOT NULL DEFAULT '',
+            response_text TEXT NOT NULL DEFAULT '',
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            answered_at TEXT,
+            UNIQUE(chat_id, retro_date)
+        )
+        """
+    )
+
+
+async def _migrate_v2_add_columns(db: aiosqlite.Connection) -> None:
+    """Add columns that were missing in early deployments (safe ALTER TABLE)."""
+    columns = await _get_table_columns(db, "tasks")
+    _optional_columns = {
+        "project_id": "ALTER TABLE tasks ADD COLUMN project_id INTEGER",
+        "due_date": "ALTER TABLE tasks ADD COLUMN due_date TEXT",
+        "planning_period": "ALTER TABLE tasks ADD COLUMN planning_period TEXT NOT NULL DEFAULT ''",
+        "notion_page_id": "ALTER TABLE tasks ADD COLUMN notion_page_id TEXT",
+        "estimated_minutes": "ALTER TABLE tasks ADD COLUMN estimated_minutes INTEGER",
+        "actual_minutes": "ALTER TABLE tasks ADD COLUMN actual_minutes INTEGER",
+        "time_estimation_accuracy": "ALTER TABLE tasks ADD COLUMN time_estimation_accuracy REAL",
+        "reminder_at": "ALTER TABLE tasks ADD COLUMN reminder_at TEXT",
+        "reminder_sent_at": "ALTER TABLE tasks ADD COLUMN reminder_sent_at TEXT",
+    }
+    for col, sql in _optional_columns.items():
+        if col not in columns:
+            await db.execute(sql)
+
+
+async def _migrate_v3_add_indices(db: aiosqlite.Connection) -> None:
+    """Add indices for common query patterns."""
+    index_statements = [
+        "CREATE INDEX IF NOT EXISTS idx_tasks_chat_id ON tasks(chat_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_chat_status ON tasks(chat_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_chat_due ON tasks(chat_id, due_date)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_chat_period ON tasks(chat_id, planning_period)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_reminder ON tasks(reminder_at) WHERE reminder_at IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_subtasks_task_id ON subtasks(task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_subtasks_chat_id ON subtasks(chat_id)",
+        "CREATE INDEX IF NOT EXISTS idx_retro_chat_date ON daily_retrospectives(chat_id, retro_date)",
+        "CREATE INDEX IF NOT EXISTS idx_projects_chat_id ON projects(chat_id)",
+    ]
+    for stmt in index_statements:
+        await db.execute(stmt)
 
 
 async def save_task(
@@ -429,6 +510,38 @@ async def list_today_focus_tasks(
         )
         rows = await cursor.fetchall()
 
+    return [dict(row) for row in rows]
+
+
+async def list_subtasks_due_today(chat_id: int, today: str) -> list[dict[str, Any]]:
+    """Return open subtasks whose due_date matches today, with parent task info."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                subtasks.id,
+                subtasks.task_id,
+                subtasks.title,
+                subtasks.status,
+                subtasks.position,
+                subtasks.due_date,
+                subtasks.estimated_minutes,
+                tasks.title AS parent_title,
+                projects.name AS project_name
+            FROM subtasks
+            JOIN tasks ON tasks.id = subtasks.task_id
+            LEFT JOIN projects ON projects.id = tasks.project_id
+            WHERE
+                subtasks.chat_id = ?
+                AND subtasks.due_date = ?
+                AND subtasks.status != 'done'
+                AND tasks.status NOT IN ('done', 'cancelled')
+            ORDER BY subtasks.position ASC
+            """,
+            (chat_id, today),
+        )
+        rows = await cursor.fetchall()
     return [dict(row) for row in rows]
 
 
@@ -1028,23 +1141,28 @@ async def list_tasks_for_notion_sync(chat_id: int, limit: int = 100) -> list[dic
 async def replace_subtasks(
     chat_id: int,
     task_id: int,
-    titles: list[str],
+    subtasks: list[dict[str, Any]],
 ) -> None:
+    """subtasks: list of {title, due_date?, estimated_minutes?}"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
-            """
-            DELETE FROM subtasks
-            WHERE chat_id = ? AND task_id = ?
-            """,
+            "DELETE FROM subtasks WHERE chat_id = ? AND task_id = ?",
             (chat_id, task_id),
         )
-        for position, title in enumerate(titles, start=1):
+        for position, item in enumerate(subtasks, start=1):
             await db.execute(
                 """
-                INSERT INTO subtasks (task_id, chat_id, title, position)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO subtasks (task_id, chat_id, title, position, due_date, estimated_minutes)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (task_id, chat_id, title, position),
+                (
+                    task_id,
+                    chat_id,
+                    item["title"],
+                    position,
+                    item.get("due_date"),
+                    item.get("estimated_minutes"),
+                ),
             )
         await db.commit()
 
@@ -1054,7 +1172,7 @@ async def list_subtasks(chat_id: int, task_id: int) -> list[dict[str, Any]]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT id, task_id, title, status, position, created_at
+            SELECT id, task_id, title, status, position, due_date, estimated_minutes, created_at
             FROM subtasks
             WHERE chat_id = ? AND task_id = ?
             ORDER BY position ASC, id ASC
@@ -1201,3 +1319,101 @@ def _calculate_time_estimation_accuracy(
     smaller = min(estimated_minutes, actual_minutes)
     bigger = max(estimated_minutes, actual_minutes)
     return round((smaller / bigger) * 100, 1)
+
+
+async def _migrate_v4_finance_tables(db: aiosqlite.Connection) -> None:
+    """Finance phase: revenue, expenses, staff, shifts, salary payments."""
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_revenue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            cash INTEGER,
+            card INTEGER,
+            total INTEGER NOT NULL,
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, date)
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS expense_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            category TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS staff_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT '',
+            rate_per_shift INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, name)
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            staff_id INTEGER NOT NULL,
+            work_date TEXT NOT NULL,
+            rate_override INTEGER,
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, staff_id, work_date)
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS salary_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            staff_id INTEGER NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            shift_count INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            paid_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    # Indices
+    for stmt in [
+        "CREATE INDEX IF NOT EXISTS idx_revenue_chat_date ON daily_revenue(chat_id, date)",
+        "CREATE INDEX IF NOT EXISTS idx_expenses_chat_date ON expense_entries(chat_id, date)",
+        "CREATE INDEX IF NOT EXISTS idx_expenses_chat_cat ON expense_entries(chat_id, category)",
+        "CREATE INDEX IF NOT EXISTS idx_shifts_chat_staff ON shifts(chat_id, staff_id)",
+        "CREATE INDEX IF NOT EXISTS idx_shifts_chat_date ON shifts(chat_id, work_date)",
+        "CREATE INDEX IF NOT EXISTS idx_staff_chat ON staff_members(chat_id)",
+    ]:
+        await db.execute(stmt)
+
+
+async def _migrate_v5_subtask_fields(db: aiosqlite.Connection) -> None:
+    """Add due_date and estimated_minutes to subtasks."""
+    columns = await _get_table_columns(db, "subtasks")
+    if "due_date" not in columns:
+        await db.execute("ALTER TABLE subtasks ADD COLUMN due_date TEXT")
+    if "estimated_minutes" not in columns:
+        await db.execute("ALTER TABLE subtasks ADD COLUMN estimated_minutes INTEGER")
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_subtasks_due ON subtasks(due_date) WHERE due_date IS NOT NULL"
+    )
