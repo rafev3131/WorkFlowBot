@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     notion_token: Optional[str] = None
     notion_parent_page_id: Optional[str] = None
     notion_tasks_data_source_id: Optional[str] = None
-    notion_version: str = "2026-03-11"
+    notion_version: str = "2022-06-28"
     morning_brief_enabled: bool = True
     morning_brief_timezone: str = "Asia/Almaty"
     morning_brief_hour: int = 10
@@ -26,6 +26,18 @@ class Settings(BaseSettings):
     agent_memory_backend: str = "chromadb"
     agent_memory_path: str = ".chroma"
     agent_memory_collection: str = "agent_memory"
+
+    # Security: comma-separated list of allowed Telegram chat IDs.
+    # Leave empty to allow any chat (development only).
+    # Example in .env: ALLOWED_CHAT_IDS=123456789,987654321
+    allowed_chat_ids: list[int] = []
+
+    # Per-chat rate limit (messages per minute). 0 = disabled.
+    rate_limit_per_minute: int = 20
+
+    # Path to a JSON file that overrides TASK_ALIASES for task_intents.
+    # Format: {"alias_key": ["needle1", "needle2"], ...}
+    task_aliases_file: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

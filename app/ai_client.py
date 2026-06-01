@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.utils.retry import async_retry
 
 
 SYSTEM_INSTRUCTIONS = """
@@ -77,7 +78,13 @@ PLANNER_INSTRUCTIONS = """
   "phases": [
     {
       "title": "название этапа",
-      "steps": ["конкретный шаг 1", "конкретный шаг 2"]
+      "steps": [
+        {
+          "title": "конкретный шаг, начинается с глагола",
+          "due_date": "YYYY-MM-DD или null если нет дедлайна",
+          "estimated_minutes": 30
+        }
+      ]
     }
   ],
   "materials": ["что подготовить"],
@@ -85,6 +92,11 @@ PLANNER_INSTRUCTIONS = """
   "clarifying_questions": ["что стоит уточнить"],
   "next_step": "один самый первый конкретный шаг"
 }
+
+Правила для подзадач:
+- due_date: если у основной задачи есть дата — распредели шаги равномерно до неё. Если нет — ставь null.
+- estimated_minutes: реалистичная оценка времени на каждый шаг (15, 30, 60, 120 и т.д.).
+- Не более 15 подзадач суммарно.
 """
 
 
@@ -126,7 +138,45 @@ RETROSPECTIVE_SUMMARY_INSTRUCTIONS = """
 """
 
 
+FINANCE_PARSER_INSTRUCTIONS = """
+Ты парсишь финансовые записи для бара в Алматы. Верни только валидный JSON без markdown.
+Текущая валюта: тенге (₸).
+
+Правила нормализации сумм:
+- "380к" или "380 тыщ" или "380 тысяч" → 380000
+- Просто "380" — оставь как есть (380)
+- Сокращения: нал/наличные = cash; карта/безнал = card
+
+Схема:
+{
+  "type": "revenue" | "expense" | "both",
+  "date": "YYYY-MM-DD",
+  "revenue": {
+    "cash": число или null,
+    "card": число или null,
+    "total": число или null
+  },
+  "expenses": [
+    {
+      "category": "продукты | напитки | зарплата | аренда | хозтовары | маркетинг | ремонт | коммунальные | прочее",
+      "amount": число,
+      "description": ""
+    }
+  ],
+  "notes": ""
+}
+
+Правила:
+- Если только итог выручки без разбивки — ставь в total, cash и card = null
+- Если revenue не упоминается — "revenue": null
+- Если расходов нет — "expenses": []
+- date: "вчера" → вчерашняя дата, не указано → сегодня (подставь из контекста)
+- type = "both" если есть и выручка и расходы
+"""
+
+
 class AIClient:
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(httpx.RequestError, RuntimeError))
     async def analyze_message(self, text: str) -> dict[str, Any]:
         if not settings.openai_api_key:
             return {
@@ -171,6 +221,7 @@ class AIClient:
 
         return json.loads(output_text)
 
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(httpx.RequestError, RuntimeError))
     async def run_planner(
         self,
         text: str,
@@ -259,6 +310,7 @@ class AIClient:
                 "raw_plan": output_text.strip(),
             }
 
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(httpx.RequestError, RuntimeError))
     async def build_morning_brief(
         self,
         today: str,
@@ -267,6 +319,7 @@ class AIClient:
         workflow_context: str,
         retrospective_context: str = "",
         memory_context: str = "",
+        yesterday_finance: str = "",
     ) -> str:
         if not settings.openai_api_key:
             return (
@@ -277,6 +330,9 @@ class AIClient:
 
         prompt = f"""
 Дата: {today}
+
+Финансы вчера:
+{yesterday_finance or "Не внесены."}
 
 Рабочий контекст:
 {workflow_context or "Не задан."}
@@ -319,6 +375,7 @@ class AIClient:
 
         return output_text.strip()
 
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(httpx.RequestError, RuntimeError))
     async def create_embedding(self, text: str) -> list[float]:
         if not settings.openai_api_key:
             return _fallback_embedding(text)
@@ -343,6 +400,7 @@ class AIClient:
         data = response.json()
         return data["data"][0]["embedding"]
 
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(httpx.RequestError, RuntimeError))
     async def summarize_retrospective(
         self,
         retro_date: str,
@@ -437,6 +495,69 @@ class AIClient:
                 await asyncio.sleep(1)
 
         raise RuntimeError(f"Не смог отправить аудио в OpenAI: {last_error}")
+
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(httpx.RequestError, RuntimeError))
+    async def parse_finance(self, text: str, today: str) -> dict[str, Any]:
+        """Parse free-text finance input into structured JSON."""
+        if not settings.openai_api_key:
+            return {"type": "both", "date": today, "revenue": None, "expenses": [], "notes": text}
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/responses",
+                headers={
+                    "Authorization": f"Bearer {settings.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.openai_model,
+                    "instructions": FINANCE_PARSER_INSTRUCTIONS,
+                    "input": f"Текущая дата: {today}\n\nЗапись пользователя:\n{text}",
+                },
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                raise RuntimeError(_format_openai_error(error.response)) from error
+
+        data = response.json()
+        output_text = data.get("output_text", "") or _extract_output_text(data)
+        try:
+            return json.loads(output_text)
+        except json.JSONDecodeError:
+            return {"type": "both", "date": today, "revenue": None, "expenses": [], "notes": text}
+
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(httpx.RequestError, RuntimeError))
+    async def generate_finance_insight(self, report_text: str) -> str:
+        """Generate a short insight/commentary for a financial report."""
+        if not settings.openai_api_key:
+            return ""
+
+        instructions = (
+            "Ты финансовый советник для бара. "
+            "На основе отчёта дай 1–3 конкретных, практичных наблюдения или совета. "
+            "Пиши коротко, по-русски. Без воды. Без вводных слов типа 'Исходя из данных'."
+        )
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/responses",
+                headers={
+                    "Authorization": f"Bearer {settings.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.openai_model,
+                    "instructions": instructions,
+                    "input": report_text,
+                },
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                raise RuntimeError(_format_openai_error(error.response)) from error
+
+        data = response.json()
+        return (data.get("output_text", "") or _extract_output_text(data)).strip()
 
 
 def _extract_output_text(data: dict[str, Any]) -> str:

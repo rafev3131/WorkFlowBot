@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.briefing import morning_brief, send_morning_brief
@@ -12,7 +13,38 @@ from app.retrospective import evening_retro
 from app.telegram_client import telegram_client
 
 
-scheduler = AsyncIOScheduler(timezone=ZoneInfo(settings.morning_brief_timezone))
+async def _send_weekly_finance_report() -> None:
+    """Send the weekly finance report to all registered chats."""
+    from datetime import date, timedelta
+    from app.finance.handlers import handle_report_command
+    from app.database import DATABASE_PATH
+    import aiosqlite
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT DISTINCT chat_id FROM daily_revenue ORDER BY chat_id"
+        )
+        rows = await cursor.fetchall()
+
+    for (chat_id,) in rows:
+        try:
+            report = await handle_report_command(chat_id=chat_id, text="/отчет прошлая")
+            await telegram_client.send_message(chat_id=chat_id, text=report)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Weekly report failed for %s: %s", chat_id, exc)
+
+# Persist jobs in a dedicated SQLite file so reminders survive restarts.
+_JOBSTORE_URL = "sqlite:///scheduler_jobs.db"
+
+_jobstores = {
+    "default": SQLAlchemyJobStore(url=_JOBSTORE_URL),
+}
+
+scheduler = AsyncIOScheduler(
+    jobstores=_jobstores,
+    timezone=ZoneInfo(settings.morning_brief_timezone),
+)
 
 
 def start_scheduler() -> None:
@@ -40,6 +72,18 @@ def start_scheduler() -> None:
             id="evening_retro",
             replace_existing=True,
         )
+
+    # Weekly finance report — every Monday at 09:00
+    scheduler.add_job(
+        _send_weekly_finance_report,
+        trigger="cron",
+        day_of_week="mon",
+        hour=9,
+        minute=0,
+        timezone=ZoneInfo(settings.morning_brief_timezone),
+        id="weekly_finance_report",
+        replace_existing=True,
+    )
 
     scheduler.start()
 
