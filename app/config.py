@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     # Per-chat rate limit (messages per minute). 0 = disabled.
     rate_limit_per_minute: int = 20
 
+    database_url: str = "postgresql://localhost/workflow"
+
     # Path to a JSON file that overrides TASK_ALIASES for task_intents.
     # Format: {"alias_key": ["needle1", "needle2"], ...}
     task_aliases_file: str = ""
